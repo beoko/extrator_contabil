@@ -1,12 +1,9 @@
 import io
 import re
-import tempfile
-from typing import List, Dict, Tuple
-
 import pandas as pd
 import streamlit as st
 import pdfplumber
-
+from typing import List
 
 # -------------------------
 # Helpers
@@ -17,86 +14,7 @@ def _normalize_text(s: str) -> str:
     return s
 
 
-def _make_unique_columns(cols) -> List[str]:
-    seen = {}
-    out = []
-    for c in list(cols):
-        c = "COL" if c is None or str(c).strip() == "" else str(c).strip()
-        if c in seen:
-            seen[c] += 1
-            out.append(f"{c}_{seen[c]}")
-        else:
-            seen[c] = 0
-            out.append(c)
-    return out
-
-
-def _br_number_to_float(x):
-    if x is None:
-        return None
-    s = str(x).strip()
-    if s == "" or s == "-":
-        return None
-
-    neg = False
-    if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1].strip()
-
-    s = s.replace("R$", "").strip()
-    s = re.sub(r"\s+", "", s)
-
-    s2 = s.replace(".", "").replace(",", ".")
-    if not re.fullmatch(r"-?\d+(\.\d+)?", s2):
-        return x
-
-    v = float(s2)
-    if neg:
-        v = -v
-    if abs(v - round(v)) < 1e-9:
-        return int(round(v))
-    return v
-
-
-def _clean_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Limpa e padroniza:
-    - remove vazios
-    - tenta promover header
-    - garante colunas únicas
-    - converte números pt-BR
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.replace(r"^\s*$", pd.NA, regex=True).dropna(how="all")
-    if df.empty:
-        return pd.DataFrame()
-
-    # Heurística simples de header (datas, controladora, consolidado etc.)
-    first = df.iloc[0].astype(str).str.lower().tolist()
-    header_hint = any(
-        ("31/12" in c) or ("30/06" in c) or ("31/03" in c) or
-        ("controladora" in c) or ("consolidado" in c) or ("nota" in c)
-        for c in first
-    )
-    if header_hint:
-        df.columns = df.iloc[0]
-        df = df.iloc[1:].copy()
-
-    # Colunas únicas SEMPRE (resolve InvalidIndexError)
-    df.columns = _make_unique_columns(df.columns)
-
-    for c in df.columns:
-        df[c] = df[c].apply(_br_number_to_float)
-
-    return df.reset_index(drop=True)
-
-
-def _find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
-    """
-    Detecção padrão (pros PDFs que já estavam funcionando pra você).
-    """
+def _find_statement_pages(pdf_path: str) -> dict:
     pages = {"balanco": [], "dre": [], "dfc": []}
 
     with pdfplumber.open(pdf_path) as pdf:
@@ -104,108 +22,137 @@ def _find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
             txt = _normalize_text(page.extract_text() or "")
 
             if "balanços patrimoniais" in txt or "balanço patrimonial" in txt:
-                if not pages["balanco"]:
-                    pages["balanco"].append(i)
-                    pages["balanco"].append(i + 1)  # geralmente ativo/passivo
+                pages["balanco"].append(i)
 
-            if ("demonstrações dos resultados" in txt or "demonstração do resultado" in txt) and not pages["dre"]:
+            if "demonstrações dos resultados" in txt or "demonstração do resultado" in txt:
                 pages["dre"].append(i)
 
-            if ("demonstrações dos fluxos de caixa" in txt or "demonstração do fluxo de caixa" in txt) and not pages["dfc"]:
+            if "demonstrações dos fluxos de caixa" in txt or "demonstração dos fluxos de caixa" in txt:
                 pages["dfc"].append(i)
-                pages["dfc"].append(i + 1)
 
-    # limpa duplicatas e páginas fora do range
-    with pdfplumber.open(pdf_path) as pdf:
-        n = len(pdf.pages)
+    if len(pages["balanco"]) == 1:
+        pages["balanco"].append(pages["balanco"][0] + 1)
+
     for k in pages:
-        pages[k] = sorted(list(dict.fromkeys([p for p in pages[k] if 1 <= p <= n])))
+        pages[k] = sorted(list(set(pages[k])))
 
     return pages
 
 
-def _extract_tables_camelot(pdf_path: str, pages: List[int]) -> List[pd.DataFrame]:
-    """
-    Camelot lattice -> stream fallback.
-    """
+def _br_number_to_float(x):
+    if x is None:
+        return x
+
+    s = str(x).strip()
+    if s == "" or s == "-":
+        return None
+
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+
+    s = s.replace("R$", "").replace(".", "").replace(",", ".")
+
+    try:
+        v = float(s)
+        return -v if neg else v
+    except:
+        return x
+
+
+def _clean_table(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.replace(r"^\s*$", pd.NA, regex=True).dropna(how="all")
+    if df.empty:
+        return df
+
+    first = df.iloc[0].astype(str).str.lower().tolist()
+    if any("31/12" in c or "30/06" in c for c in first):
+        df.columns = df.iloc[0]
+        df = df.iloc[1:]
+
+    for c in df.columns:
+        df[c] = df[c].apply(_br_number_to_float)
+
+    return df.reset_index(drop=True)
+
+
+def _extract_tables(pdf_path: str, pages: List[int]) -> List[pd.DataFrame]:
     if not pages:
         return []
 
     import camelot
     page_str = ",".join(map(str, pages))
-    dfs: List[pd.DataFrame] = []
+    tables = []
 
-    # lattice
     try:
         tables = camelot.read_pdf(pdf_path, pages=page_str, flavor="lattice")
-        for t in tables:
-            d = _clean_table(t.df)
-            if not d.empty:
-                dfs.append(d)
-    except Exception:
+    except:
         pass
 
-    # stream fallback
-    if not dfs:
+    if not tables:
         try:
             tables = camelot.read_pdf(pdf_path, pages=page_str, flavor="stream")
-            for t in tables:
-                d = _clean_table(t.df)
-                if not d.empty:
-                    dfs.append(d)
-        except Exception:
+        except:
             pass
 
-    return dfs
+    return [_clean_table(t.df) for t in tables if not t.df.empty]
 
 
 # -------------------------
 # Core multi-PDF
 # -------------------------
 def process_multiple_pdfs(files) -> bytes:
+    import tempfile
     out = io.BytesIO()
 
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        # garante 1 sheet sempre
-        pd.DataFrame({"info": ["Extrator Balanço/DRE/DFC (Camelot)"]}).to_excel(
+        # Aba inicial garante que sempre exista pelo menos 1 sheet
+        pd.DataFrame({"info": ["Gerado pelo extrator (Balanço/DRE/DFC)."]}).to_excel(
             writer, sheet_name="INFO", index=False
         )
 
+        if not files:
+            # Se por algum motivo vier vazio, ainda assim não quebra
+            pd.DataFrame({"info": ["Nenhum PDF enviado."]}).to_excel(
+                writer, sheet_name="SEM_ARQUIVOS", index=False
+            )
+            return out.getvalue()
+
         for file in files:
-            file.seek(0)
-            pdf_bytes = file.read()
+            try:
+                # importantíssimo no Streamlit: reposiciona o ponteiro do arquivo
+                file.seek(0)
+                pdf_bytes = file.read()
 
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(pdf_bytes)
-                pdf_path = tmp.name
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    tmp.write(pdf_bytes)
+                    pdf_path = tmp.name
 
-            # ✅ PATCH: se for o 6.pdf, força páginas (ajuste se precisar)
-            fname = (file.name or "").lower()
-            if fname.endswith("6.pdf") or fname == "6.pdf" or "6.pdf" in fname:
-                pages = {"balanco": [5, 6], "dre": [7], "dfc": [8, 9]}
-            else:
                 pages = _find_statement_pages(pdf_path)
 
-            base = re.sub(r"[^A-Za-z0-9_]+", "_", file.name.replace(".pdf", ""))[:18] or "arquivo"
+                # nome base curto para caber em sheet (31 chars)
+                base = re.sub(r"[^A-Za-z0-9_]+", "_", file.name.replace(".pdf", ""))[:18]
 
-            for key, label in [("balanco", "BAL"), ("dre", "DRE"), ("dfc", "DFC")]:
-                tables = _extract_tables_camelot(pdf_path, pages.get(key, []))
-                sheet = f"{base}_{label}"[:31]
+                for key, label in [("balanco", "BAL"), ("dre", "DRE"), ("dfc", "DFC")]:
+                    tables = _extract_tables(pdf_path, pages.get(key, []))
 
-                if not tables:
-                    pd.DataFrame(
-                        {"info": [f"Nenhuma tabela encontrada ({label}). Páginas: {pages.get(key, [])}"]}
-                    ).to_excel(writer, sheet_name=sheet, index=False)
-                    continue
+                    sheet = f"{base}_{label}"[:31]
 
-                # ✅ garante colunas únicas antes de concatenar
-                for i in range(len(tables)):
-                    tables[i].columns = _make_unique_columns(tables[i].columns)
+                    if not tables:
+                        pd.DataFrame(
+                            {"info": [f"Nenhuma tabela encontrada ({label}). Páginas detectadas: {pages.get(key, [])}"]}
+                        ).to_excel(writer, sheet_name=sheet, index=False)
+                    else:
+                        df_all = pd.concat(tables, ignore_index=True)
+                        df_all.to_excel(writer, sheet_name=sheet, index=False)
 
-                df_all = pd.concat(tables, ignore_index=True)
-                df_all.columns = _make_unique_columns(df_all.columns)
-
-                df_all.to_excel(writer, sheet_name=sheet, index=False)
+            except Exception as e:
+                # Se um PDF falhar, registra o erro numa aba e segue o resto
+                err_sheet = f"ERRO_{re.sub(r'[^A-Za-z0-9_]+','_', file.name)[:24]}"[:31]
+                pd.DataFrame({"arquivo": [file.name], "erro": [repr(e)]}).to_excel(
+                    writer, sheet_name=err_sheet, index=False
+                )
 
     return out.getvalue()
 
@@ -214,7 +161,12 @@ def process_multiple_pdfs(files) -> bytes:
 # Streamlit UI
 # -------------------------
 st.set_page_config(page_title="Extrator PDF → Excel", layout="wide")
-st.title("Extrator PDF → Excel (Balanço / DRE / DFC)")
+st.title("Upload múltiplo de PDFs – DRE, Balanço e DFC")
+
+st.write(
+    "Faça upload de **vários PDFs ao mesmo tempo**. "
+    "Vou extrair Balanço, DRE e DFC de cada um e gerar **um único Excel**."
+)
 
 uploaded_files = st.file_uploader(
     "Selecione os PDFs",
@@ -226,10 +178,10 @@ if uploaded_files:
     st.info(f"{len(uploaded_files)} arquivos selecionados")
 
     if st.button("Processar todos"):
-        with st.spinner("Extraindo..."):
+        with st.spinner("Extraindo dados..."):
             excel_bytes = process_multiple_pdfs(uploaded_files)
 
-        st.success("Concluído!")
+        st.success("Processamento concluído!")
         st.download_button(
             "Baixar Excel consolidado",
             data=excel_bytes,
