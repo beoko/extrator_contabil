@@ -1,9 +1,7 @@
-# streamlit_app.py
 import io
 import re
-import math
 import tempfile
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -11,7 +9,7 @@ import pdfplumber
 
 
 # =========================
-# Utilitários gerais
+# Utils
 # =========================
 def norm(s: str) -> str:
     s = (s or "").lower()
@@ -39,7 +37,6 @@ def make_unique_columns(cols) -> List[str]:
 
 
 def br_to_number(x):
-    """Converte números pt-BR e parênteses negativo. Se não for número, mantém."""
     if x is None:
         return None
     s = str(x).strip()
@@ -67,148 +64,148 @@ def br_to_number(x):
 
 
 # =========================
-# 1) Encontrar páginas (índice + fallback)
+# DETECÇÃO DE PÁGINAS (CORRIGIDA)
 # =========================
-INDEX_KEYS = {
-    "balanco": ["balanços patrimoniais", "balancos patrimoniais", "balanço patrimonial", "balanco patrimonial"],
-    "dre": ["demonstrações dos resultados", "demonstracoes dos resultados", "demonstração do resultado", "demonstracao do resultado"],
-    "dfc": ["demonstrações dos fluxos de caixa", "demonstracoes dos fluxos de caixa", "demonstração dos fluxos de caixa", "demonstracao dos fluxos de caixa", "demonstração do fluxo de caixa", "demonstracao do fluxo de caixa"],
-}
-
-# padrões de "próxima seção" pra saber quando parar páginas contínuas
-STOP_TITLES = [
-    "demonstrações dos resultados abrangentes",
-    "demonstracoes dos resultados abrangentes",
-    "demonstrações das mutações do patrimônio líquido",
-    "demonstracoes das mutacoes do patrimonio liquido",
-    "demonstrações do valor adicionado",
-    "demonstracoes do valor adicionado",
-    "notas explicativas",
+BAL_KEYS = ["balanços patrimoniais", "balancos patrimoniais", "balanço patrimonial", "balanco patrimonial"]
+DRE_KEYS = ["demonstrações dos resultados", "demonstracoes dos resultados", "demonstração do resultado", "demonstracao do resultado"]
+DFC_KEYS = [
+    "demonstrações dos fluxos de caixa", "demonstracoes dos fluxos de caixa",
+    "demonstração dos fluxos de caixa", "demonstracao dos fluxos de caixa",
+    "demonstração do fluxo de caixa", "demonstracao do fluxo de caixa",
 ]
 
+INDEX_MARKERS = ["conteúdo", "conteudo", "índice", "indice", "composição do capital", "composicao do capital"]
 
-def pages_from_index(pdf: pdfplumber.PDF) -> Dict[str, List[int]]:
+
+def is_index_like(t: str) -> bool:
     """
-    Lê a página do Índice (geralmente página 2) e tenta capturar o número da página.
-    Ex.: "Balanços patrimoniais .......... 7"
+    Heurística: página de sumário/índice tem marcadores + muitos números pequenos de página (2,4,6...).
     """
-    out = {"balanco": [], "dre": [], "dfc": []}
-
-    # tenta achar uma página que tenha "Índice"
-    idx_page = None
-    for i in range(min(4, len(pdf.pages))):
-        t = norm(pdf.pages[i].extract_text() or "")
-        if "índice" in t or "indice" in t:
-            idx_page = i
-            break
-
-    if idx_page is None:
-        return out
-
-    txt = norm(pdf.pages[idx_page].extract_text() or "")
-    # pega linhas e tenta achar "... <numero>"
-    lines = [l.strip() for l in txt.split(" ")]
-
-    # melhor: regex no texto inteiro por cada chave
-    for k, keys in INDEX_KEYS.items():
-        for kw in keys:
-            m = re.search(rf"{re.escape(kw)}.*?(\d{{1,3}})\b", txt)
-            if m:
-                out[k] = [int(m.group(1))]
-                break
-        # não continua se já achou
-    return out
+    tt = norm(t)
+    if any(m in tt for m in INDEX_MARKERS):
+        # se tem vários números de 1-2 dígitos, típico de sumário
+        small_nums = re.findall(r"\b\d{1,2}\b", tt)
+        if len(small_nums) >= 8:
+            return True
+        return True
+    return False
 
 
-def page_has_any(text: str, patterns: List[str]) -> bool:
-    t = norm(text)
-    return any(p in t for p in patterns)
+def count_numeric_tokens(t: str) -> int:
+    """
+    Conta "números contábeis" (ex: 17.546, 167.871, 1.234.567, 123.456)
+    """
+    tt = norm(t)
+    # milhares com ponto (pt-BR) ou números grandes
+    nums = re.findall(r"\b\d{1,3}(?:\.\d{3})+\b|\b\d{4,}\b", tt)
+    return len(nums)
+
+
+def score_page_for_statement(t: str, keys: List[str]) -> int:
+    """
+    Pontua páginas que parecem uma demonstração:
+    - contém keyword
+    - contém '(em milhares' (muito comum nas DFs)
+    - tem muitos números (densidade)
+    - não é índice
+    """
+    tt = norm(t)
+    if is_index_like(tt):
+        return -999
+
+    s = 0
+    if any(k in tt for k in keys):
+        s += 50
+    if "em milhares" in tt:
+        s += 30
+
+    # densidade numérica
+    n = count_numeric_tokens(tt)
+    if n >= 15:
+        s += 30
+    elif n >= 8:
+        s += 15
+    elif n >= 4:
+        s += 5
+
+    # pistas úteis
+    if "controladora" in tt or "consolidado" in tt:
+        s += 5
+    if "ativo" in tt or "passivo" in tt:
+        s += 3
+
+    return s
 
 
 def find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
     """
-    CORRETO: detecta pelas páginas reais do PDF (título no topo), ignorando o número do índice.
+    Seleciona páginas do PDF por evidência de demonstração (não pelo índice).
+    Balanço geralmente 2 páginas (ou 1 com ativo+passivo), DFC às vezes 2.
     """
     pages = {"balanco": [], "dre": [], "dfc": []}
 
-    bal_title = ["balanços patrimoniais", "balancos patrimoniais", "balanço patrimonial", "balanco patrimonial"]
-    dre_title = ["demonstrações dos resultados", "demonstracoes dos resultados", "demonstração do resultado", "demonstracao do resultado"]
-    dfc_title = ["demonstrações dos fluxos de caixa", "demonstracoes dos fluxos de caixa", "demonstração do fluxo de caixa", "demonstracao do fluxo de caixa"]
-
-    stop_titles = [
-        "demonstrações dos resultados abrangentes",
-        "demonstracoes dos resultados abrangentes",
-        "demonstrações das mutações do patrimônio líquido",
-        "demonstracoes das mutacoes do patrimonio liquido",
-        "demonstrações do valor adicionado",
-        "demonstracoes do valor adicionado",
-        "notas explicativas",
-    ]
-
-    def has_any(t: str, arr: List[str]) -> bool:
-        t = norm(t)
-        return any(a in t for a in arr)
-
-    def is_stop(t: str) -> bool:
-        t = norm(t)
-        return any(s in t for s in stop_titles)
-
     with pdfplumber.open(pdf_path) as pdf:
         texts = [(p.extract_text() or "") for p in pdf.pages]
+        n_pages = len(texts)
 
-    # encontra 1ª ocorrência real
-    first_bal = next((i for i, t in enumerate(texts, start=1) if has_any(t, bal_title)), None)
-    first_dre = next((i for i, t in enumerate(texts, start=1) if has_any(t, dre_title)), None)
-    first_dfc = next((i for i, t in enumerate(texts, start=1) if has_any(t, dfc_title)), None)
+    # escolhe a melhor página (maior score) para cada demo
+    def best_page(keys: List[str]) -> int | None:
+        best_i = None
+        best_s = -10**9
+        for i, t in enumerate(texts, start=1):
+            s = score_page_for_statement(t, keys)
+            if s > best_s:
+                best_s = s
+                best_i = i
+        # exige um score mínimo decente para não pegar lixo
+        return best_i if best_s >= 55 else None
 
-    # BAL: normalmente 2 páginas (Ativo e Passivo)
-    if first_bal:
-        pages["balanco"].append(first_bal)
-        if first_bal < len(texts):
-            tnext = texts[first_bal]  # next page (1-based -> index = first_bal)
-            # inclui a página seguinte se parece continuidade e não virou outra seção
-            if (not is_stop(tnext)) and (("passivo" in norm(tnext)) or ("ativo" in norm(tnext)) or ("controladora" in norm(tnext))):
-                pages["balanco"].append(first_bal + 1)
+    bal_p = best_page(BAL_KEYS)
+    dre_p = best_page(DRE_KEYS)
+    dfc_p = best_page(DFC_KEYS)
 
-    # DRE: normalmente 1 página; inclui +1 se ainda for a mesma demo e não parou
-    if first_dre:
-        pages["dre"].append(first_dre)
-        if first_dre < len(texts):
-            tnext = texts[first_dre]
-            if has_any(tnext, dre_title) and not is_stop(tnext):
-                pages["dre"].append(first_dre + 1)
+    # BAL: tenta pegar 2 páginas se a seguinte também parece tabela/continuação
+    if bal_p:
+        pages["balanco"].append(bal_p)
+        if bal_p < n_pages:
+            s_next = score_page_for_statement(texts[bal_p], BAL_KEYS)  # texts index = bal_p (próxima página)
+            # se a próxima tem muitos números e não é índice, assume continuação (ativo/passivo)
+            if not is_index_like(texts[bal_p]) and count_numeric_tokens(texts[bal_p]) >= 8 and s_next >= 20:
+                pages["balanco"].append(bal_p + 1)
 
-    # DFC: às vezes 1 ou 2 páginas
-    if first_dfc:
-        pages["dfc"].append(first_dfc)
-        if first_dfc < len(texts):
-            tnext = texts[first_dfc]
-            if (has_any(tnext, dfc_title) or ("fluxo de caixa" in norm(tnext))) and not is_stop(tnext):
-                pages["dfc"].append(first_dfc + 1)
+    # DRE: normalmente 1 página; inclui próxima se ainda estiver forte
+    if dre_p:
+        pages["dre"].append(dre_p)
+        if dre_p < n_pages:
+            if count_numeric_tokens(texts[dre_p]) >= 8 and not is_index_like(texts[dre_p]):
+                # só inclui se não virou "resultado abrangente"/outra seção
+                if "resultado abrangente" not in norm(texts[dre_p]):
+                    pages["dre"].append(dre_p + 1)
 
-    # limpa
+    # DFC: pode ser 1 ou 2 páginas
+    if dfc_p:
+        pages["dfc"].append(dfc_p)
+        if dfc_p < n_pages:
+            if count_numeric_tokens(texts[dfc_p]) >= 8 and not is_index_like(texts[dfc_p]):
+                pages["dfc"].append(dfc_p + 1)
+
+    # limpar duplicatas e páginas fora do range
     for k in pages:
-        pages[k] = sorted(list(dict.fromkeys([p for p in pages[k] if p and p > 0])))
+        pages[k] = sorted(list(dict.fromkeys([p for p in pages[k] if 1 <= p <= n_pages])))
 
     return pages
 
 
-
 # =========================
-# 2) Extrair tabela por coordenadas (robusto)
+# EXTRAÇÃO POR COORDENADAS (pdfplumber)
 # =========================
 def cluster_columns(xs: List[float], tol: float = 18.0) -> List[float]:
-    """
-    Agrupa posições x em "colunas" por proximidade.
-    tol em pontos (PDF units). Ajuste se precisar.
-    """
     xs = sorted(xs)
     if not xs:
         return []
     centers = [xs[0]]
     for x in xs[1:]:
         if abs(x - centers[-1]) <= tol:
-            # atualiza centro por média simples
             centers[-1] = (centers[-1] + x) / 2
         else:
             centers.append(x)
@@ -218,15 +215,10 @@ def cluster_columns(xs: List[float], tol: float = 18.0) -> List[float]:
 def assign_col(x: float, centers: List[float]) -> int:
     if not centers:
         return 0
-    j = min(range(len(centers)), key=lambda i: abs(x - centers[i]))
-    return j
+    return min(range(len(centers)), key=lambda i: abs(x - centers[i]))
 
 
 def extract_table_xy(pdf_path: str, page_num: int) -> pd.DataFrame:
-    """
-    Extrai "tabela" a partir de palavras e suas coordenadas.
-    Funciona melhor que Camelot em PDFs contábeis com colunas múltiplas.
-    """
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_num - 1]
         words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
@@ -234,14 +226,12 @@ def extract_table_xy(pdf_path: str, page_num: int) -> pd.DataFrame:
     if not words:
         return pd.DataFrame()
 
-    # filtra coisas muito no rodapé (número de página isolado)
-    # e muito no topo (título)
-    # (ajuste leve pra não jogar fora header de tabela)
+    # filtra topo/rodapé (remove títulos e numeração de página)
     filtered = []
     for w in words:
-        if w.get("text", "").strip() == "":
+        if (w.get("text") or "").strip() == "":
             continue
-        if w["top"] < 55:  # topo
+        if w["top"] < 60:  # topo
             continue
         if w["top"] > (page.height - 35):  # rodapé
             continue
@@ -250,32 +240,28 @@ def extract_table_xy(pdf_path: str, page_num: int) -> pd.DataFrame:
     if not filtered:
         return pd.DataFrame()
 
-    # 1) detectar colunas por x0 (começo das palavras)
     xs = [w["x0"] for w in filtered]
     centers = cluster_columns(xs, tol=18.0)
 
-    # 2) agrupar linhas por y (top arredondado)
     rows: Dict[float, List[Tuple[int, str]]] = {}
     for w in filtered:
         y = round(w["top"], 1)
-        col = assign_col(w["x0"], centers)
-        rows.setdefault(y, []).append((col, w["text"]))
+        c = assign_col(w["x0"], centers)
+        rows.setdefault(y, []).append((c, w["text"]))
 
-    # 3) ordenar linhas e montar matriz
     y_sorted = sorted(rows.keys())
     ncols = max(len(centers), max((max(c for c, _ in rows[y]) + 1) for y in y_sorted))
 
     matrix = []
     for y in y_sorted:
         line = [""] * ncols
-        items = sorted(rows[y], key=lambda x: x[0])
-        # concatena textos que caem na mesma coluna
+        items = rows[y]
         tmp = {}
         for c, t in items:
             tmp.setdefault(c, []).append(t)
         for c, parts in tmp.items():
             line[c] = " ".join(parts).strip()
-        # remove linhas praticamente vazias
+        # exige pelo menos 2 células preenchidas para ser "linha de tabela"
         if sum(1 for v in line if str(v).strip()) >= 2:
             matrix.append(line)
 
@@ -283,20 +269,12 @@ def extract_table_xy(pdf_path: str, page_num: int) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(matrix, columns=[f"C{i}" for i in range(len(matrix[0]))])
-
-    # tenta converter números
     for c in df.columns:
         df[c] = df[c].apply(br_to_number)
-
     return df
 
 
 def extract_statement(pdf_path: str, pages: List[int]) -> pd.DataFrame:
-    """
-    Extrai uma demonstração juntando as páginas:
-    - adiciona marcadores de página
-    - concatena com linha em branco entre páginas
-    """
     blocks = []
     for p in pages:
         dfp = extract_table_xy(pdf_path, p)
@@ -304,8 +282,7 @@ def extract_statement(pdf_path: str, pages: List[int]) -> pd.DataFrame:
             continue
         dfp.insert(0, "_page", p)
         blocks.append(dfp)
-        # separador
-        blocks.append(pd.DataFrame([[""] * len(dfp.columns)], columns=dfp.columns))
+        blocks.append(pd.DataFrame([[""] * len(dfp.columns)], columns=dfp.columns))  # separador
 
     if not blocks:
         return pd.DataFrame()
@@ -316,14 +293,14 @@ def extract_statement(pdf_path: str, pages: List[int]) -> pd.DataFrame:
 
 
 # =========================
-# 3) Multi-PDF -> Excel
+# MULTI-PDF -> EXCEL
 # =========================
 def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
     out = io.BytesIO()
     status_rows = []
 
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        pd.DataFrame({"info": ["Gerado pelo extrator (Balanço/DRE/DFC) via coordenadas (pdfplumber)."]}).to_excel(
+        pd.DataFrame({"info": ["Gerado pelo extrator (Balanço/DRE/DFC) - correção anti-sumário."]}).to_excel(
             writer, sheet_name="INFO", index=False
         )
 
@@ -363,7 +340,6 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
                         status_rows.append({"arquivo": f.name, "demo": label, "status": "sem_tabela", "paginas": str(pgs)})
                         continue
 
-                    # salva
                     df.to_excel(writer, sheet_name=sheet, index=False)
                     status_rows.append({"arquivo": f.name, "demo": label, "status": "ok", "paginas": str(pgs)})
 
@@ -379,15 +355,10 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
 
 
 # =========================
-# UI Streamlit
+# UI
 # =========================
 st.set_page_config(page_title="Extrator Contábil (PDF → Excel)", layout="wide")
 st.title("Extrator Contábil: Balanço, DRE e DFC (PDF → Excel)")
-
-st.write(
-    "Upload múltiplo de PDFs e geração de Excel consolidado.\n"
-    "Este extrator usa **pdfplumber + coordenadas (x/y)**, mais robusto que Camelot para PDFs contábeis."
-)
 
 uploaded_files = st.file_uploader(
     "Selecione os PDFs (pode múltiplo)",
@@ -399,7 +370,7 @@ if uploaded_files:
     st.info(f"{len(uploaded_files)} arquivo(s) selecionado(s).")
 
     if st.button("Processar todos"):
-        with st.spinner("Processando..."):
+        with st.spinner("Processando (ignorando sumário e buscando páginas reais)..."):
             xlsx_bytes, status_df = process_multiple_pdfs(uploaded_files)
 
         st.success("Concluído!")
@@ -411,5 +382,5 @@ if uploaded_files:
             file_name="demonstracoes_consolidadas.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
-st.caption("Se algum PDF ficar com colunas “esticadas”, dá pra ajustar o `tol` em `cluster_columns()` (18→14 ou 22).")
+else:
+    st.caption("Dica: selecione vários PDFs de uma vez na janela de upload.")
