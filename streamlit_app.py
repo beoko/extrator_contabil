@@ -19,29 +19,22 @@ def _normalize_text(s: str) -> str:
 
 
 def _find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
-    """
-    Varre o PDF e tenta localizar páginas por palavras-chave.
-    Retorna dict: {"balanco":[..], "dre":[..], "dfc":[..]}
-    """
     pages = {"balanco": [], "dre": [], "dfc": []}
 
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             txt = _normalize_text(page.extract_text() or "")
 
-            # Balanço patrimonial (às vezes split em 2 páginas)
             if "balanços patrimoniais" in txt or "balanço patrimonial" in txt:
                 pages["balanco"].append(i)
 
-            # DRE
             if "demonstrações dos resultados" in txt or "demonstração do resultado" in txt:
                 pages["dre"].append(i)
 
-            # DFC
             if "demonstrações dos fluxos de caixa" in txt or "demonstração dos fluxos de caixa" in txt:
                 pages["dfc"].append(i)
 
-    # Se achou 1 página de balanço, geralmente é 2 (ativo/passivo): adiciona a próxima
+    # Balanço costuma ser 2 páginas (ativo e passivo)
     if len(pages["balanco"]) == 1:
         pages["balanco"].append(pages["balanco"][0] + 1)
 
@@ -52,33 +45,9 @@ def _find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
 
 
 # -------------------------
-# Helpers (tabelas / limpeza)
+# Helpers (limpeza robusta)
 # -------------------------
-def _make_unique_columns(cols) -> List[str]:
-    """
-    Garante nomes de colunas únicos (evita InvalidIndexError ao escrever Excel).
-    """
-    seen = {}
-    out = []
-    for c in list(cols):
-        c = "COL" if c is None or str(c).strip() == "" else str(c).strip()
-        if c in seen:
-            seen[c] += 1
-            out.append(f"{c}_{seen[c]}")
-        else:
-            seen[c] = 0
-            out.append(c)
-    return out
-
-
 def _br_number_to_float(x):
-    """
-    Converte:
-      '1.234.567' -> 1234567
-      '(1.234)'   -> -1234
-      '1.234,56'  -> 1234.56
-    Se não for número, retorna original.
-    """
     if x is None:
         return None
 
@@ -92,13 +61,10 @@ def _br_number_to_float(x):
         s = s[1:-1].strip()
 
     s = s.replace("R$", "").strip()
-
-    # remove espaços internos
     s = re.sub(r"\s+", "", s)
 
-    # separador BR
+    # BR: milhares '.' e decimal ','
     s2 = s.replace(".", "").replace(",", ".")
-
     if not re.fullmatch(r"-?\d+(\.\d+)?", s2):
         return x
 
@@ -110,13 +76,12 @@ def _br_number_to_float(x):
     return v
 
 
-def _clean_table(df: pd.DataFrame) -> pd.DataFrame:
+def _clean_table_robust(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Limpa e tenta melhorar tabela:
-    - remove linhas vazias
-    - usa 1a linha como header se parecer cabeçalho (datas etc.)
-    - converte números
-    - garante colunas únicas
+    Versão 100% robusta contra colunas duplicadas:
+    - NÃO promove primeira linha como header (evita nomes duplicados)
+    - Força colunas para C0..Cn sempre
+    - Converte números BR célula a célula (quando possível)
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -126,21 +91,11 @@ def _clean_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # normaliza para string
-    df = df.astype(str)
+    # padroniza colunas
+    df = df.copy()
+    df.columns = [f"C{i}" for i in range(df.shape[1])]
 
-    # tenta promover primeira linha como header se tiver datas ou títulos típicos
-    first = [str(x).lower() for x in df.iloc[0].tolist()]
-    header_hint = any(("31/12" in c) or ("30/06" in c) or ("controladora" in c) or ("consolidado" in c) for c in first)
-
-    if header_hint:
-        df.columns = df.iloc[0]
-        df = df.iloc[1:].copy()
-
-    # garante colunas únicas sempre
-    df.columns = _make_unique_columns(df.columns)
-
-    # converte números “BR” onde fizer sentido
+    # converte números (sem assumir tipos)
     for c in df.columns:
         df[c] = df[c].apply(_br_number_to_float)
 
@@ -148,39 +103,26 @@ def _clean_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _extract_tables_camelot(pdf_path: str, pages: List[int]) -> List[pd.DataFrame]:
-    """
-    Extrai tabelas com Camelot (lattice -> stream fallback).
-    Retorna lista de DataFrames já limpos.
-    """
     if not pages:
         return []
 
-    # Import aqui para não quebrar import geral caso Camelot não esteja instalado
     import camelot
 
     page_str = ",".join(map(str, pages))
     dfs: List[pd.DataFrame] = []
 
-    # 1) lattice
-    try:
-        tables = camelot.read_pdf(pdf_path, pages=page_str, flavor="lattice")
-        for t in tables:
-            d = _clean_table(t.df)
-            if not d.empty:
-                dfs.append(d)
-    except Exception:
-        pass
-
-    # 2) stream
-    if not dfs:
+    # lattice -> stream fallback
+    for flavor in ("lattice", "stream"):
         try:
-            tables = camelot.read_pdf(pdf_path, pages=page_str, flavor="stream")
+            tables = camelot.read_pdf(pdf_path, pages=page_str, flavor=flavor)
             for t in tables:
-                d = _clean_table(t.df)
+                d = _clean_table_robust(t.df)
                 if not d.empty:
                     dfs.append(d)
+            if dfs:
+                break
         except Exception:
-            pass
+            continue
 
     return dfs
 
@@ -189,18 +131,11 @@ def _extract_tables_camelot(pdf_path: str, pages: List[int]) -> List[pd.DataFram
 # Core (multi PDF -> Excel)
 # -------------------------
 def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
-    """
-    Processa N PDFs:
-      - Cria um Excel com abas <arquivo>_BAL / _DRE / _DFC
-      - Sempre cria aba INFO (evita 'At least one sheet must be visible')
-      - Se um PDF falhar, cria aba ERRO_<arquivo>
-    Retorna: (xlsx_bytes, status_df)
-    """
     out = io.BytesIO()
     status_rows = []
 
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        # Garante 1 aba sempre
+        # garante pelo menos uma aba
         pd.DataFrame({"info": ["Gerado pelo extrator (Balanço/DRE/DFC)."]}).to_excel(
             writer, sheet_name="INFO", index=False
         )
@@ -224,10 +159,7 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
 
                 pages = _find_statement_pages(pdf_path)
 
-                # base curta para nome de aba (máx 31 chars no Excel)
-                base = re.sub(r"[^A-Za-z0-9_]+", "_", file.name.replace(".pdf", ""))[:18]
-                if not base:
-                    base = "arquivo"
+                base = re.sub(r"[^A-Za-z0-9_]+", "_", file.name.replace(".pdf", ""))[:18] or "arquivo"
 
                 for key, label in [("balanco", "BAL"), ("dre", "DRE"), ("dfc", "DFC")]:
                     tables = _extract_tables_camelot(pdf_path, pages.get(key, []))
@@ -253,10 +185,12 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
                             }
                         )
                     else:
+                        # concat agora é seguro porque TODAS têm colunas C0..Cn
                         df_all = pd.concat(tables, ignore_index=True)
 
-                        # ✅ garante colunas únicas antes de salvar
-                        df_all.columns = _make_unique_columns(df_all.columns)
+                        # adiciona colunas de rastreio (opcional, mas ajuda muito)
+                        df_all.insert(0, "_arquivo", file.name)
+                        df_all.insert(1, "_demo", label)
 
                         df_all.to_excel(writer, sheet_name=sheet, index=False)
 
@@ -279,7 +213,6 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
                     {"arquivo": file.name, "demonstracao": "-", "status": "erro", "paginas": "", "detalhe": repr(e)}
                 )
 
-        # Aba de status geral
         status_df = pd.DataFrame(status_rows) if status_rows else pd.DataFrame(
             [{"arquivo": "-", "demonstracao": "-", "status": "sem_resultados", "paginas": "", "detalhe": ""}]
         )
@@ -295,8 +228,8 @@ st.set_page_config(page_title="Extrator PDF → Excel (DRE/Balanço/DFC)", layou
 st.title("Extrair DRE, Balanço e DFC de PDFs e gerar Excel")
 
 st.write(
-    "Faça upload de **vários PDFs** (ex.: 5 arquivos). Vou tentar detectar as páginas de **Balanço**, **DRE** e **DFC** "
-    "e extrair as tabelas para um único Excel."
+    "Faça upload de **vários PDFs**. O app detecta páginas de **Balanço**, **DRE** e **DFC** "
+    "e tenta extrair as tabelas para um único Excel."
 )
 
 uploaded_files = st.file_uploader(
@@ -321,6 +254,5 @@ if uploaded_files:
             file_name="demonstracoes_consolidadas.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
 else:
-    st.caption("Dica: você pode selecionar vários PDFs de uma vez na janela de upload.")
+    st.caption("Dica: selecione vários PDFs de uma vez no upload.")
