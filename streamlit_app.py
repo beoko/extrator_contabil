@@ -127,82 +127,71 @@ def page_has_any(text: str, patterns: List[str]) -> bool:
 
 def find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
     """
-    Estratégia:
-    1) tenta Índice: pega a página inicial de cada demo (muito confiável em 1.pdf..5.pdf)
-    2) expande "contíguas" até detectar outra seção/título
-    3) fallback: varrer páginas e pegar primeira ocorrência real dos títulos
+    CORRETO: detecta pelas páginas reais do PDF (título no topo), ignorando o número do índice.
     """
     pages = {"balanco": [], "dre": [], "dfc": []}
 
+    bal_title = ["balanços patrimoniais", "balancos patrimoniais", "balanço patrimonial", "balanco patrimonial"]
+    dre_title = ["demonstrações dos resultados", "demonstracoes dos resultados", "demonstração do resultado", "demonstracao do resultado"]
+    dfc_title = ["demonstrações dos fluxos de caixa", "demonstracoes dos fluxos de caixa", "demonstração do fluxo de caixa", "demonstracao do fluxo de caixa"]
+
+    stop_titles = [
+        "demonstrações dos resultados abrangentes",
+        "demonstracoes dos resultados abrangentes",
+        "demonstrações das mutações do patrimônio líquido",
+        "demonstracoes das mutacoes do patrimonio liquido",
+        "demonstrações do valor adicionado",
+        "demonstracoes do valor adicionado",
+        "notas explicativas",
+    ]
+
+    def has_any(t: str, arr: List[str]) -> bool:
+        t = norm(t)
+        return any(a in t for a in arr)
+
+    def is_stop(t: str) -> bool:
+        t = norm(t)
+        return any(s in t for s in stop_titles)
+
     with pdfplumber.open(pdf_path) as pdf:
-        idx = pages_from_index(pdf)
+        texts = [(p.extract_text() or "") for p in pdf.pages]
 
-        # ---------- expandir por contiguidade ----------
-        def expand_from(start_page_1based: int, include_keywords: List[str]) -> List[int]:
-            if start_page_1based <= 0 or start_page_1based > len(pdf.pages):
-                return []
-            outp = []
-            i = start_page_1based
-            while 1 <= i <= len(pdf.pages):
-                txt = norm(pdf.pages[i - 1].extract_text() or "")
-                # condição de permanência: ainda tem keyword (ou é continuação imediata da mesma tabela)
-                # e NÃO entrou em outra seção (STOP)
-                has_kw = any(kw in txt for kw in include_keywords)
-                has_stop = any(stp in txt for stp in STOP_TITLES)
+    # encontra 1ª ocorrência real
+    first_bal = next((i for i, t in enumerate(texts, start=1) if has_any(t, bal_title)), None)
+    first_dre = next((i for i, t in enumerate(texts, start=1) if has_any(t, dre_title)), None)
+    first_dfc = next((i for i, t in enumerate(texts, start=1) if has_any(t, dfc_title)), None)
 
-                # regra prática:
-                # - sempre inclui a página inicial
-                # - inclui mais 1 página se a inicial tem tabela e a próxima é continuação (às vezes sem repetir título)
-                if i == start_page_1based:
-                    outp.append(i)
-                    i += 1
-                    continue
+    # BAL: normalmente 2 páginas (Ativo e Passivo)
+    if first_bal:
+        pages["balanco"].append(first_bal)
+        if first_bal < len(texts):
+            tnext = texts[first_bal]  # next page (1-based -> index = first_bal)
+            # inclui a página seguinte se parece continuidade e não virou outra seção
+            if (not is_stop(tnext)) and (("passivo" in norm(tnext)) or ("ativo" in norm(tnext)) or ("controladora" in norm(tnext))):
+                pages["balanco"].append(first_bal + 1)
 
-                # se a página seguinte ainda tem tabela/continuação: muitos PDFs repetem o cabeçalho da demo
-                if has_kw and not has_stop:
-                    outp.append(i)
-                    i += 1
-                    continue
+    # DRE: normalmente 1 página; inclui +1 se ainda for a mesma demo e não parou
+    if first_dre:
+        pages["dre"].append(first_dre)
+        if first_dre < len(texts):
+            tnext = texts[first_dre]
+            if has_any(tnext, dre_title) and not is_stop(tnext):
+                pages["dre"].append(first_dre + 1)
 
-                # caso específico: balanço frequentemente quebra em 2 páginas (ativo/passivo) ou
-                # a continuação não repete o título, mas repete “Controladora / Consolidado / Nota / Ativo / Passivo”.
-                cont_hint = ("controladora" in txt or "consolidado" in txt or "ativo" in txt or "passivo" in txt) and not has_stop
-                if cont_hint and (i == start_page_1based + 1):
-                    outp.append(i)
-                    i += 1
-                    continue
+    # DFC: às vezes 1 ou 2 páginas
+    if first_dfc:
+        pages["dfc"].append(first_dfc)
+        if first_dfc < len(texts):
+            tnext = texts[first_dfc]
+            if (has_any(tnext, dfc_title) or ("fluxo de caixa" in norm(tnext))) and not is_stop(tnext):
+                pages["dfc"].append(first_dfc + 1)
 
-                break
-
-            return outp
-
-        # se índice achou, usa como base
-        if idx["balanco"]:
-            # balanço às vezes é 2 páginas de tabela; expand resolve
-            pages["balanco"] = expand_from(idx["balanco"][0], INDEX_KEYS["balanco"])
-        if idx["dre"]:
-            pages["dre"] = expand_from(idx["dre"][0], INDEX_KEYS["dre"])
-        if idx["dfc"]:
-            pages["dfc"] = expand_from(idx["dfc"][0], INDEX_KEYS["dfc"])
-
-        # ---------- fallback: varrer se faltou ----------
-        if not pages["balanco"] or not pages["dre"] or not pages["dfc"]:
-            for i, p in enumerate(pdf.pages, start=1):
-                txt = norm(p.extract_text() or "")
-                if not pages["balanco"] and page_has_any(txt, INDEX_KEYS["balanco"]):
-                    pages["balanco"] = [i, min(i + 1, len(pdf.pages))]
-                if not pages["dre"] and page_has_any(txt, INDEX_KEYS["dre"]):
-                    pages["dre"] = [i]
-                if not pages["dfc"] and page_has_any(txt, INDEX_KEYS["dfc"]):
-                    pages["dfc"] = [i, min(i + 1, len(pdf.pages))]
-                if pages["balanco"] and pages["dre"] and pages["dfc"]:
-                    break
-
-    # limpar duplicatas/ordenar
+    # limpa
     for k in pages:
-        pages[k] = sorted(list(dict.fromkeys([p for p in pages[k] if p > 0])))
+        pages[k] = sorted(list(dict.fromkeys([p for p in pages[k] if p and p > 0])))
 
     return pages
+
 
 
 # =========================
