@@ -1,4 +1,3 @@
-# streamlit_app.py
 import io
 import re
 import tempfile
@@ -10,7 +9,7 @@ import pdfplumber
 
 
 # -------------------------
-# Helpers (texto / páginas)
+# Texto / normalização
 # -------------------------
 def _normalize_text(s: str) -> str:
     s = (s or "").lower()
@@ -18,25 +17,70 @@ def _normalize_text(s: str) -> str:
     return s
 
 
-def _find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
+# -------------------------
+# Índice (página 1) -> páginas corretas
+# -------------------------
+def _pages_from_index(pdf_path: str) -> Dict[str, List[int]]:
+    """
+    Tenta ler a página 1 (ÍNDICE) e extrair números de página.
+    Retorna {"balanco":[ativo, passivo], "dre":[x], "dfc":[y]} quando encontrar.
+    """
+    with pdfplumber.open(pdf_path) as pdf:
+        if not pdf.pages:
+            return {"balanco": [], "dre": [], "dfc": []}
+
+        txt = _normalize_text(pdf.pages[0].extract_text() or "")
+
+    # Ex.: "balanço patrimonial ativo 2"
+    m_ba = re.search(r"balan[çc]o patrimonial ativo\s+(\d+)", txt)
+    m_bp = re.search(r"balan[çc]o patrimonial passivo\s+(\d+)", txt)
+    m_dre = re.search(r"demonstra[çc][ãa]o do resultado\s+(\d+)", txt)
+
+    # Ex.: "demonstração do fluxo de caixa (método indireto) 8"
+    m_dfc = re.search(r"demonstra[çc][ãa]o do fluxo de caixa.*?\s(\d+)", txt)
+
+    pages = {"balanco": [], "dre": [], "dfc": []}
+
+    if m_ba:
+        pages["balanco"].append(int(m_ba.group(1)))
+    if m_bp:
+        pages["balanco"].append(int(m_bp.group(1)))
+    if m_dre:
+        pages["dre"].append(int(m_dre.group(1)))
+    if m_dfc:
+        pages["dfc"].append(int(m_dfc.group(1)))
+
+    # remove duplicatas/ordena
+    for k in pages:
+        pages[k] = sorted(list(dict.fromkeys(pages[k])))
+
+    return pages
+
+
+def _fallback_find_pages(pdf_path: str) -> Dict[str, List[int]]:
+    """
+    Fallback: se não conseguir ler o índice, faz busca simples,
+    mas pega apenas a PRIMEIRA ocorrência real (evita pegar dezenas de páginas).
+    """
     pages = {"balanco": [], "dre": [], "dfc": []}
 
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             txt = _normalize_text(page.extract_text() or "")
 
-            if "balanços patrimoniais" in txt or "balanço patrimonial" in txt:
-                pages["balanco"].append(i)
+            # Evita index (pág 1) e coisas muito genéricas
+            if i == 1:
+                continue
 
-            if "demonstrações dos resultados" in txt or "demonstração do resultado" in txt:
+            if not pages["balanco"] and ("balanço patrimonial" in txt or "balancos patrimonial" in txt):
+                pages["balanco"].append(i)
+                pages["balanco"].append(i + 1)  # geralmente ativo/passivo em sequência
+
+            if not pages["dre"] and ("demonstração do resultado" in txt or "demonstrações dos resultados" in txt):
                 pages["dre"].append(i)
 
-            if "demonstrações dos fluxos de caixa" in txt or "demonstração dos fluxos de caixa" in txt:
+            if not pages["dfc"] and ("fluxo de caixa" in txt or "fluxos de caixa" in txt):
                 pages["dfc"].append(i)
-
-    # Balanço costuma ser 2 páginas (ativo e passivo)
-    if len(pages["balanco"]) == 1:
-        pages["balanco"].append(pages["balanco"][0] + 1)
 
     for k in pages:
         pages[k] = sorted(list(dict.fromkeys(pages[k])))
@@ -44,8 +88,19 @@ def _find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
     return pages
 
 
+def _find_statement_pages(pdf_path: str) -> Dict[str, List[int]]:
+    # 1) tenta pelo índice (mais confiável)
+    pages = _pages_from_index(pdf_path)
+
+    # se vier vazio demais, usa fallback
+    if (not pages["balanco"] and not pages["dre"] and not pages["dfc"]):
+        pages = _fallback_find_pages(pdf_path)
+
+    return pages
+
+
 # -------------------------
-# Helpers (limpeza robusta)
+# Limpeza robusta
 # -------------------------
 def _br_number_to_float(x):
     if x is None:
@@ -78,30 +133,30 @@ def _br_number_to_float(x):
 
 def _clean_table_robust(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Versão 100% robusta contra colunas duplicadas:
-    - NÃO promove primeira linha como header (evita nomes duplicados)
-    - Força colunas para C0..Cn sempre
-    - Converte números BR célula a célula (quando possível)
+    100% robusto:
+    - não promove cabeçalho (evita colunas duplicadas)
+    - força colunas C0..Cn
+    - converte números br
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # remove linhas totalmente vazias
     df = df.replace(r"^\s*$", pd.NA, regex=True).dropna(how="all")
     if df.empty:
         return pd.DataFrame()
 
-    # padroniza colunas
     df = df.copy()
     df.columns = [f"C{i}" for i in range(df.shape[1])]
 
-    # converte números (sem assumir tipos)
     for c in df.columns:
         df[c] = df[c].apply(_br_number_to_float)
 
     return df.reset_index(drop=True)
 
 
+# -------------------------
+# Extração com Camelot
+# -------------------------
 def _extract_tables_camelot(pdf_path: str, pages: List[int]) -> List[pd.DataFrame]:
     if not pages:
         return []
@@ -128,7 +183,7 @@ def _extract_tables_camelot(pdf_path: str, pages: List[int]) -> List[pd.DataFram
 
 
 # -------------------------
-# Core (multi PDF -> Excel)
+# Processamento multi-PDF -> Excel
 # -------------------------
 def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
     out = io.BytesIO()
@@ -139,12 +194,6 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
         pd.DataFrame({"info": ["Gerado pelo extrator (Balanço/DRE/DFC)."]}).to_excel(
             writer, sheet_name="INFO", index=False
         )
-
-        if not files:
-            pd.DataFrame({"info": ["Nenhum PDF enviado."]}).to_excel(
-                writer, sheet_name="SEM_ARQUIVOS", index=False
-            )
-            return out.getvalue(), pd.DataFrame([{"arquivo": "-", "status": "sem_arquivos", "detalhe": ""}])
 
         for file in files:
             try:
@@ -162,46 +211,28 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
                 base = re.sub(r"[^A-Za-z0-9_]+", "_", file.name.replace(".pdf", ""))[:18] or "arquivo"
 
                 for key, label in [("balanco", "BAL"), ("dre", "DRE"), ("dfc", "DFC")]:
-                    tables = _extract_tables_camelot(pdf_path, pages.get(key, []))
+                    pgs = pages.get(key, [])
+                    tables = _extract_tables_camelot(pdf_path, pgs)
+
                     sheet = f"{base}_{label}"[:31]
 
                     if not tables:
                         pd.DataFrame(
-                            {
-                                "info": [
-                                    f"Nenhuma tabela encontrada ({label}).",
-                                    f"Páginas detectadas: {pages.get(key, [])}",
-                                ]
-                            }
+                            {"info": [f"Nenhuma tabela encontrada ({label}).", f"Páginas: {pgs}"]}
                         ).to_excel(writer, sheet_name=sheet, index=False)
-
                         status_rows.append(
-                            {
-                                "arquivo": file.name,
-                                "demonstracao": label,
-                                "status": "ok_sem_tabela",
-                                "paginas": str(pages.get(key, [])),
-                                "detalhe": "",
-                            }
+                            {"arquivo": file.name, "demonstracao": label, "status": "ok_sem_tabela", "paginas": str(pgs)}
                         )
                     else:
-                        # concat agora é seguro porque TODAS têm colunas C0..Cn
+                        # concat seguro (todas têm C0..Cn)
                         df_all = pd.concat(tables, ignore_index=True)
-
-                        # adiciona colunas de rastreio (opcional, mas ajuda muito)
                         df_all.insert(0, "_arquivo", file.name)
                         df_all.insert(1, "_demo", label)
+                        df_all.insert(2, "_paginas", str(pgs))
 
                         df_all.to_excel(writer, sheet_name=sheet, index=False)
-
                         status_rows.append(
-                            {
-                                "arquivo": file.name,
-                                "demonstracao": label,
-                                "status": "ok",
-                                "paginas": str(pages.get(key, [])),
-                                "detalhe": f"{len(tables)} tabela(s)",
-                            }
+                            {"arquivo": file.name, "demonstracao": label, "status": "ok", "paginas": str(pgs)}
                         )
 
             except Exception as e:
@@ -210,11 +241,11 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
                     writer, sheet_name=err_sheet, index=False
                 )
                 status_rows.append(
-                    {"arquivo": file.name, "demonstracao": "-", "status": "erro", "paginas": "", "detalhe": repr(e)}
+                    {"arquivo": file.name, "demonstracao": "-", "status": "erro", "paginas": "", "erro": repr(e)}
                 )
 
         status_df = pd.DataFrame(status_rows) if status_rows else pd.DataFrame(
-            [{"arquivo": "-", "demonstracao": "-", "status": "sem_resultados", "paginas": "", "detalhe": ""}]
+            [{"arquivo": "-", "demonstracao": "-", "status": "sem_resultados"}]
         )
         status_df.to_excel(writer, sheet_name="STATUS", index=False)
 
@@ -227,13 +258,8 @@ def process_multiple_pdfs(files) -> Tuple[bytes, pd.DataFrame]:
 st.set_page_config(page_title="Extrator PDF → Excel (DRE/Balanço/DFC)", layout="wide")
 st.title("Extrair DRE, Balanço e DFC de PDFs e gerar Excel")
 
-st.write(
-    "Faça upload de **vários PDFs**. O app detecta páginas de **Balanço**, **DRE** e **DFC** "
-    "e tenta extrair as tabelas para um único Excel."
-)
-
 uploaded_files = st.file_uploader(
-    "Selecione os PDFs",
+    "Selecione os PDFs (pode ser múltiplo)",
     type=["pdf"],
     accept_multiple_files=True
 )
@@ -255,4 +281,4 @@ if uploaded_files:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 else:
-    st.caption("Dica: selecione vários PDFs de uma vez no upload.")
+    st.caption("Dica: selecione vários PDFs de uma vez na janela de upload.")
