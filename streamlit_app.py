@@ -93,3 +93,6 @@ def _find_statement_pages(pdf_path: str) -> dict:
                     index_page_nums.append(i)
 
         report
+
+
+#VERSAO FINAL
