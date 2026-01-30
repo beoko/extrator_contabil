@@ -107,51 +107,31 @@ def process_multiple_pdfs(files) -> bytes:
     out = io.BytesIO()
 
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        # Aba inicial garante que sempre exista pelo menos 1 sheet
-        pd.DataFrame({"info": ["Gerado pelo extrator (Balanço/DRE/DFC)."]}).to_excel(
-            writer, sheet_name="INFO", index=False
-        )
-
-        if not files:
-            # Se por algum motivo vier vazio, ainda assim não quebra
-            pd.DataFrame({"info": ["Nenhum PDF enviado."]}).to_excel(
-                writer, sheet_name="SEM_ARQUIVOS", index=False
-            )
-            return out.getvalue()
-
         for file in files:
-            try:
-                # importantíssimo no Streamlit: reposiciona o ponteiro do arquivo
-                file.seek(0)
-                pdf_bytes = file.read()
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(file.read())
+                pdf_path = tmp.name
 
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                    tmp.write(pdf_bytes)
-                    pdf_path = tmp.name
+            pages = _find_statement_pages(pdf_path)
 
-                pages = _find_statement_pages(pdf_path)
+            base = file.name.replace(".pdf", "")[:20]
 
-                # nome base curto para caber em sheet (31 chars)
-                base = re.sub(r"[^A-Za-z0-9_]+", "_", file.name.replace(".pdf", ""))[:18]
+            for key, label in [("balanco", "BAL"), ("dre", "DRE"), ("dfc", "DFC")]:
+                tables = _extract_tables(pdf_path, pages[key])
 
-                for key, label in [("balanco", "BAL"), ("dre", "DRE"), ("dfc", "DFC")]:
-                    tables = _extract_tables(pdf_path, pages.get(key, []))
+                if not tables:
+                    pd.DataFrame(
+                        {"info": [f"Nenhuma tabela encontrada ({label})"]}
+                    ).to_excel(
+                        writer, sheet_name=f"{base}_{label}", index=False
+                    )
+                    continue
 
-                    sheet = f"{base}_{label}"[:31]
-
-                    if not tables:
-                        pd.DataFrame(
-                            {"info": [f"Nenhuma tabela encontrada ({label}). Páginas detectadas: {pages.get(key, [])}"]}
-                        ).to_excel(writer, sheet_name=sheet, index=False)
-                    else:
-                        df_all = pd.concat(tables, ignore_index=True)
-                        df_all.to_excel(writer, sheet_name=sheet, index=False)
-
-            except Exception as e:
-                # Se um PDF falhar, registra o erro numa aba e segue o resto
-                err_sheet = f"ERRO_{re.sub(r'[^A-Za-z0-9_]+','_', file.name)[:24]}"[:31]
-                pd.DataFrame({"arquivo": [file.name], "erro": [repr(e)]}).to_excel(
-                    writer, sheet_name=err_sheet, index=False
+                df_all = pd.concat(tables, ignore_index=True)
+                df_all.to_excel(
+                    writer,
+                    sheet_name=f"{base}_{label}"[:31],
+                    index=False
                 )
 
     return out.getvalue()
