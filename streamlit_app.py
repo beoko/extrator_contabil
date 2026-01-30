@@ -3,7 +3,7 @@ import re
 import pandas as pd
 import streamlit as st
 import pdfplumber
-from typing import List
+from typing import List, Dict, Optional
 
 # -------------------------
 # Helpers
@@ -13,158 +13,83 @@ def _normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def _extract_lines(page_text: str) -> List[str]:
+    return [ln.strip() for ln in (page_text or "").splitlines() if ln.strip()]
+
+def _find_pdf_page_of_report(pdf) -> Optional[int]:
+    """
+    Tenta localizar onde começa o relatório (auditor/revisão).
+    Isso ajuda a calcular o offset entre numeração "impressa" e página real do PDF.
+    """
+    needles = [
+        "relatório do auditor independente",
+        "relatório dos auditores independentes",
+        "relatório sobre a revisão",
+        "relatório sobre a revisão das informações trimestrais",
+    ]
+    for i, page in enumerate(pdf.pages, start=1):
+        txt = _normalize_text(page.extract_text() or "")
+        if any(n in txt for n in needles):
+            return i
+    return None
+
+def _parse_index_page(lines: List[str]) -> Dict[str, int]:
+    """
+    Extrai os números finais no Índice/Conteúdo.
+    Retorna páginas "impressas" (não as páginas reais do PDF).
+    """
+    joined = " \n".join(lines).lower()
+
+    def find_last_int(patterns: List[str]) -> Optional[int]:
+        for pat in patterns:
+            m = re.search(pat, joined, flags=re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+        return None
+
+    # Aceita variações comuns
+    p_bal = find_last_int([
+        r"balanços\s+patrimoniais\s*\.{0,}\s*(\d+)",
+        r"balanço\s+patrimonial\s*\.{0,}\s*(\d+)",
+    ])
+    p_dre = find_last_int([
+        r"demonstrações\s+dos\s+resultados\s*\.{0,}\s*(\d+)",
+        r"demonstração\s+do\s+resultado\s*\.{0,}\s*(\d+)",
+    ])
+    p_dfc = find_last_int([
+        r"demonstrações\s+dos\s+fluxos\s+de\s+caixa\s*\.{0,}\s*(\d+)",
+        r"demonstração\s+dos\s+fluxos\s+de\s+caixa\s*\.{0,}\s*(\d+)",
+        r"fluxos\s+de\s+caixa\s*\.{0,}\s*(\d+)",
+    ])
+    p_rel = find_last_int([
+        r"relatório.*?\s(\d+)\b",
+    ])
+
+    out = {}
+    if p_bal is not None: out["balanco"] = p_bal
+    if p_dre is not None: out["dre"] = p_dre
+    if p_dfc is not None: out["dfc"] = p_dfc
+    if p_rel is not None: out["relatorio"] = p_rel
+    return out
 
 def _find_statement_pages(pdf_path: str) -> dict:
+    """
+    Estratégia:
+      1) Tenta pegar páginas via Índice/Conteúdo (mais confiável nesses PDFs).
+      2) Converte para páginas reais do PDF via offset.
+      3) Fallback: varredura por palavras-chave (teu método antigo).
+    """
     pages = {"balanco": [], "dre": [], "dfc": []}
 
     with pdfplumber.open(pdf_path) as pdf:
+        # --- 1) achar página do índice/conteúdo ---
+        index_page_nums = []
         for i, page in enumerate(pdf.pages, start=1):
-            txt = _normalize_text(page.extract_text() or "")
+            txt_raw = page.extract_text() or ""
+            txt = _normalize_text(txt_raw)
+            if ("índice" in txt) or ("indice" in txt) or ("conteúdo" in txt) or ("conteudo" in txt):
+                # evita falso positivo no corpo: precisa ter várias ocorrências de "demonstrações" ou "balanços"
+                if ("balan" in txt) and ("demonstra" in txt):
+                    index_page_nums.append(i)
 
-            if "balanços patrimoniais" in txt or "balanço patrimonial" in txt:
-                pages["balanco"].append(i)
-
-            if "demonstrações dos resultados" in txt or "demonstração do resultado" in txt:
-                pages["dre"].append(i)
-
-            if "demonstrações dos fluxos de caixa" in txt or "demonstração dos fluxos de caixa" in txt:
-                pages["dfc"].append(i)
-
-    if len(pages["balanco"]) == 1:
-        pages["balanco"].append(pages["balanco"][0] + 1)
-
-    for k in pages:
-        pages[k] = sorted(list(set(pages[k])))
-
-    return pages
-
-
-def _br_number_to_float(x):
-    if x is None:
-        return x
-
-    s = str(x).strip()
-    if s == "" or s == "-":
-        return None
-
-    neg = False
-    if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1]
-
-    s = s.replace("R$", "").replace(".", "").replace(",", ".")
-
-    try:
-        v = float(s)
-        return -v if neg else v
-    except:
-        return x
-
-
-def _clean_table(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.replace(r"^\s*$", pd.NA, regex=True).dropna(how="all")
-    if df.empty:
-        return df
-
-    first = df.iloc[0].astype(str).str.lower().tolist()
-    if any("31/12" in c or "30/06" in c for c in first):
-        df.columns = df.iloc[0]
-        df = df.iloc[1:]
-
-    for c in df.columns:
-        df[c] = df[c].apply(_br_number_to_float)
-
-    return df.reset_index(drop=True)
-
-
-def _extract_tables(pdf_path: str, pages: List[int]) -> List[pd.DataFrame]:
-    if not pages:
-        return []
-
-    import camelot
-    page_str = ",".join(map(str, pages))
-    tables = []
-
-    try:
-        tables = camelot.read_pdf(pdf_path, pages=page_str, flavor="lattice")
-    except:
-        pass
-
-    if not tables:
-        try:
-            tables = camelot.read_pdf(pdf_path, pages=page_str, flavor="stream")
-        except:
-            pass
-
-    return [_clean_table(t.df) for t in tables if not t.df.empty]
-
-
-# -------------------------
-# Core multi-PDF
-# -------------------------
-def process_multiple_pdfs(files) -> bytes:
-    import tempfile
-    out = io.BytesIO()
-
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        for file in files:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(file.read())
-                pdf_path = tmp.name
-
-            pages = _find_statement_pages(pdf_path)
-
-            base = file.name.replace(".pdf", "")[:20]
-
-            for key, label in [("balanco", "BAL"), ("dre", "DRE"), ("dfc", "DFC")]:
-                tables = _extract_tables(pdf_path, pages[key])
-
-                if not tables:
-                    pd.DataFrame(
-                        {"info": [f"Nenhuma tabela encontrada ({label})"]}
-                    ).to_excel(
-                        writer, sheet_name=f"{base}_{label}", index=False
-                    )
-                    continue
-
-                df_all = pd.concat(tables, ignore_index=True)
-                df_all.to_excel(
-                    writer,
-                    sheet_name=f"{base}_{label}"[:31],
-                    index=False
-                )
-
-    return out.getvalue()
-
-
-# -------------------------
-# Streamlit UI
-# -------------------------
-st.set_page_config(page_title="Extrator PDF → Excel", layout="wide")
-st.title("Upload múltiplo de PDFs – DRE, Balanço e DFC")
-
-st.write(
-    "Faça upload de **vários PDFs ao mesmo tempo**. "
-    "Vou extrair Balanço, DRE e DFC de cada um e gerar **um único Excel**."
-)
-
-uploaded_files = st.file_uploader(
-    "Selecione os PDFs",
-    type=["pdf"],
-    accept_multiple_files=True
-)
-
-if uploaded_files:
-    st.info(f"{len(uploaded_files)} arquivos selecionados")
-
-    if st.button("Processar todos"):
-        with st.spinner("Extraindo dados..."):
-            excel_bytes = process_multiple_pdfs(uploaded_files)
-
-        st.success("Processamento concluído!")
-        st.download_button(
-            "Baixar Excel consolidado",
-            data=excel_bytes,
-            file_name="demonstracoes_consolidadas.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        report
